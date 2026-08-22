@@ -1,0 +1,36 @@
+name: "ScanPrint"
+description: "Automatic scan-to-print service via CUPS"
+version: "0.5.1"
+slug: "scanprint"
+init: false
+startup: application
+
+url: "https://github.com/bggsolar/scanprint"
+
+arch:
+  - amd64
+
+services:
+  - mqtt:need
+
+map:
+  - type: share
+    read_only: false
+
+options:
+  cups_host: "homeassistant.local"
+  cups_port: 631
+  simplex_queue: "Printer_Simplex"
+  duplex_queue: "Printer_Duplex"
+  copies_default: 1
+  print_mode_default: "Simplex"
+  collate: true
+
+schema:
+  cups_host: str
+  cups_port: port
+  simplex_queue: str
+  duplex_queue: str
+  copies_default: "int(1,20)"
+  print_mode_default: "list(Simplex|Duplex)"
+  collate: bool
