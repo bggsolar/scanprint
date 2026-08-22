@@ -1,6 +1,6 @@
 name: "ScanPrint"
 description: "Automatic scan-to-print service via CUPS"
-version: "0.5.1"
+version: "0.5.2"
 slug: "scanprint"
 init: false
 startup: application

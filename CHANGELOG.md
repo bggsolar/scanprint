@@ -2,6 +2,33 @@
 
 All notable changes to ScanPrint are documented in this file.
 
+## [0.5.2] - 2026-08-22
+
+### Added
+- `binary_sensor.scanprint_ready`.
+- `sensor.scanprint_multicopy_pending`.
+- `sensor.scanprint_multicopy_next`.
+- `sensor.scanprint_failed_count`.
+- `sensor.scanprint_last_job`.
+- Live monitoring of the `multicopy` and `failed` directories.
+- Startup listing of available CUPS queues.
+- Basic configuration validation.
+- App architecture in startup/version information.
+- Expanded HAOS installation and operating notes.
+- Troubleshooting section in README.
+- Updated `DOCS.md`.
+
+### Changed
+- Multicopy status now reflects the number of waiting documents.
+- Runtime state is rebuilt from the actual filesystem state after restart.
+- Queue-precheck logging is more informative.
+- Duplex capability detection remains a warning rather than a fatal startup error.
+- Documentation now describes repository-based installation as the recommended deployment path.
+
+### Fixed
+- Reduced ambiguity when configured CUPS queue names do not exist.
+- Improved visibility of failed print files and waiting multicopy jobs.
+
 ## [0.5.1] - 2026-08-22
 
 ### Added

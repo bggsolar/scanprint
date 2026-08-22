@@ -1,21 +1,42 @@
 # ScanPrint Documentation
 
-See the repository `README.md` for installation, configuration, workflows, and limitations.
+## Home Assistant OS reference setup
+
+```text
+Home Assistant OS
+├── Samba Share
+├── Mosquitto Broker
+├── CUPS Print Server
+└── ScanPrint
+```
 
 ## Quick start
 
-1. Install and configure a CUPS server.
-2. Ensure Home Assistant has an MQTT service available.
-3. Install ScanPrint from the repository.
-4. Configure:
-   - CUPS host
-   - CUPS port
-   - Simplex queue
-   - Duplex queue
-5. Configure the scanner to write PDF files to one of:
-   - `/share/scanprint/simple`
-   - `/share/scanprint/duplex`
-   - `/share/scanprint/multicopy`
-6. Check the ScanPrint log for successful startup prechecks.
+1. Install and configure CUPS.
+2. Ensure a Supervisor-provided MQTT service is available.
+3. Add `https://github.com/bggsolar/scanprint` to the Home Assistant App Store repositories.
+4. Install ScanPrint.
+5. Configure CUPS host, port, Simplex queue and Duplex queue.
+6. Start ScanPrint.
+7. Verify the startup log.
+8. Configure scanner SMB destinations.
 
-ScanPrint is beta software.
+## Scanner folders
+
+- `/share/scanprint/simple`
+- `/share/scanprint/duplex`
+- `/share/scanprint/multicopy`
+
+Failed jobs are stored in:
+
+- `/share/scanprint/failed`
+
+## Diagnostics in Home Assistant
+
+- `binary_sensor.scanprint_ready`
+- `sensor.scanprint_multicopy_pending`
+- `sensor.scanprint_multicopy_next`
+- `sensor.scanprint_failed_count`
+- `sensor.scanprint_last_job`
+
+See `README.md` for complete documentation and troubleshooting.

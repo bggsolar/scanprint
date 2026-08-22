@@ -3,6 +3,7 @@
 set -u
 
 APP_VERSION="${APP_VERSION:-unknown}"
+APP_ARCH="${APP_ARCH:-unknown}"
 
 CUPS_HOST="$(bashio::config 'cups_host')"
 CUPS_PORT="$(bashio::config 'cups_port')"
@@ -32,6 +33,8 @@ MQTT_DISCOVERY="homeassistant"
 
 COPIES="$COPIES_DEFAULT"
 PRINT_MODE="$PRINT_MODE_DEFAULT"
+READY_STATE="offline"
+LAST_JOB="none"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
@@ -64,6 +67,44 @@ create_directories() {
         "$DUPLEX_DIR" \
         "$MULTICOPY_DIR" \
         "$FAILED_DIR"
+}
+
+validate_config() {
+    local failed=0
+
+    if [ -z "$CUPS_HOST" ]; then
+        log_error "cups_host darf nicht leer sein"
+        failed=1
+    fi
+
+    if [ -z "$SIMPLE_QUEUE" ]; then
+        log_error "simplex_queue darf nicht leer sein"
+        failed=1
+    fi
+
+    if [ -z "$DUPLEX_QUEUE" ]; then
+        log_error "duplex_queue darf nicht leer sein"
+        failed=1
+    fi
+
+    case "$PRINT_MODE_DEFAULT" in
+        Simplex|Duplex) ;;
+        *)
+            log_error "print_mode_default muss Simplex oder Duplex sein"
+            failed=1
+            ;;
+    esac
+
+    if ! [[ "$COPIES_DEFAULT" =~ ^[0-9]+$ ]] ||
+       [ "$COPIES_DEFAULT" -lt 1 ] ||
+       [ "$COPIES_DEFAULT" -gt 20 ]; then
+        log_error "copies_default muss zwischen 1 und 20 liegen"
+        failed=1
+    fi
+
+    if [ "$failed" -ne 0 ]; then
+        exit 1
+    fi
 }
 
 load_state() {
@@ -99,6 +140,64 @@ save_state() {
 COPIES=$COPIES
 PRINT_MODE=$PRINT_MODE
 EOF
+}
+
+count_pdfs() {
+    local dir="$1"
+    find "$dir" -maxdepth 1 -type f -iname '*.pdf' | wc -l | tr -d ' '
+}
+
+get_oldest_pdf() {
+    local dir="$1"
+    local file
+    local mtime
+    local oldest_file=""
+    local oldest_mtime=""
+
+    while IFS= read -r -d '' file; do
+        mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
+
+        if [ -z "$oldest_file" ] || [ "$mtime" -lt "$oldest_mtime" ]; then
+            oldest_file="$file"
+            oldest_mtime="$mtime"
+        fi
+    done < <(
+        find "$dir" -maxdepth 1 -type f -iname '*.pdf' -print0
+    )
+
+    printf '%s' "$oldest_file"
+}
+
+publish_runtime_state() {
+    local pending failed next_file next_name
+
+    pending="$(count_pdfs "$MULTICOPY_DIR")"
+    failed="$(count_pdfs "$FAILED_DIR")"
+    next_file="$(get_oldest_pdf "$MULTICOPY_DIR")"
+
+    if [ -n "$next_file" ]; then
+        next_name="$(basename "$next_file")"
+    else
+        next_name="none"
+    fi
+
+    mqtt_pub -r -t "$MQTT_BASE/multicopy/pending" -m "$pending"
+    mqtt_pub -r -t "$MQTT_BASE/multicopy/next" -m "$next_name"
+    mqtt_pub -r -t "$MQTT_BASE/failed/count" -m "$failed"
+    mqtt_pub -r -t "$MQTT_BASE/last_job" -m "$LAST_JOB"
+    mqtt_pub -r -t "$MQTT_BASE/ready" -m "$READY_STATE"
+
+    if [ "$READY_STATE" = "online" ]; then
+        if [ "$pending" -gt 0 ]; then
+            mqtt_pub -r \
+                -t "$MQTT_BASE/job/status" \
+                -m "$pending Dokument(e) warten"
+        else
+            mqtt_pub -r \
+                -t "$MQTT_BASE/job/status" \
+                -m "bereit"
+        fi
+    fi
 }
 
 check_share() {
@@ -137,6 +236,25 @@ check_cups_connection() {
 
     log_ok "CUPS erreichbar: $CUPS_SERVER"
     return 0
+}
+
+list_available_queues() {
+    local queues
+
+    queues="$(
+        lpstat -h "$CUPS_SERVER" -a 2>/dev/null |
+        awk '{print $1}' |
+        sort -u
+    )"
+
+    if [ -n "$queues" ]; then
+        log "Verfügbare CUPS-Queues:"
+        while IFS= read -r queue; do
+            [ -n "$queue" ] && log "  - $queue"
+        done <<< "$queues"
+    else
+        log_warn "Keine verfügbaren CUPS-Queues ermittelt"
+    fi
 }
 
 check_queue() {
@@ -181,18 +299,24 @@ run_prechecks() {
     check_share || failed=1
     check_mqtt || failed=1
     check_cups_connection || failed=1
-    check_queue "$SIMPLE_QUEUE" "Simplex" || failed=1
-    check_queue "$DUPLEX_QUEUE" "Duplex" || failed=1
-    check_duplex_support
+
+    if [ "$failed" -eq 0 ]; then
+        list_available_queues
+        check_queue "$SIMPLE_QUEUE" "Simplex" || failed=1
+        check_queue "$DUPLEX_QUEUE" "Duplex" || failed=1
+        check_duplex_support
+    fi
 
     log "================================================="
 
     if [ "$failed" -ne 0 ]; then
+        READY_STATE="offline"
         log_error "Precheck fehlgeschlagen."
         log_error "ScanPrint wird nicht gestartet."
         exit 1
     fi
 
+    READY_STATE="online"
     log_ok "Alle erforderlichen Abhängigkeiten verfügbar"
 }
 
@@ -202,12 +326,14 @@ publish_discovery() {
     DEVICE="$(
         jq -nc \
             --arg version "$APP_VERSION" \
+            --arg arch "$APP_ARCH" \
             '{
                 identifiers:["scanprint"],
                 name:"ScanPrint",
-                manufacturer:"Local",
+                manufacturer:"bggsolar",
                 model:"HAOS ScanPrint",
-                sw_version:$version
+                sw_version:$version,
+                hw_version:$arch
             }'
     )"
 
@@ -275,10 +401,83 @@ publish_discovery() {
             device:$device
         }')"
 
+    mqtt_pub -r \
+        -t "$MQTT_DISCOVERY/binary_sensor/scanprint/ready/config" \
+        -m "$(jq -nc --argjson device "$DEVICE" '{
+            name:"Bereit",
+            unique_id:"scanprint_ready",
+            default_entity_id:"binary_sensor.scanprint_ready",
+            state_topic:"scanprint/ready",
+            payload_on:"online",
+            payload_off:"offline",
+            device_class:"connectivity",
+            icon:"mdi:check-network-outline",
+            device:$device
+        }')"
+
+    mqtt_pub -r \
+        -t "$MQTT_DISCOVERY/sensor/scanprint/multicopy_pending/config" \
+        -m "$(jq -nc --argjson device "$DEVICE" '{
+            name:"Mehrfachkopien wartend",
+            unique_id:"scanprint_multicopy_pending",
+            default_entity_id:"sensor.scanprint_multicopy_pending",
+            state_topic:"scanprint/multicopy/pending",
+            unit_of_measurement:"Dokumente",
+            icon:"mdi:tray-full",
+            availability_topic:"scanprint/status",
+            payload_available:"online",
+            payload_not_available:"offline",
+            device:$device
+        }')"
+
+    mqtt_pub -r \
+        -t "$MQTT_DISCOVERY/sensor/scanprint/multicopy_next/config" \
+        -m "$(jq -nc --argjson device "$DEVICE" '{
+            name:"Nächste Mehrfachkopie",
+            unique_id:"scanprint_multicopy_next",
+            default_entity_id:"sensor.scanprint_multicopy_next",
+            state_topic:"scanprint/multicopy/next",
+            icon:"mdi:file-document-outline",
+            availability_topic:"scanprint/status",
+            payload_available:"online",
+            payload_not_available:"offline",
+            device:$device
+        }')"
+
+    mqtt_pub -r \
+        -t "$MQTT_DISCOVERY/sensor/scanprint/failed_count/config" \
+        -m "$(jq -nc --argjson device "$DEVICE" '{
+            name:"Fehlgeschlagene Dokumente",
+            unique_id:"scanprint_failed_count",
+            default_entity_id:"sensor.scanprint_failed_count",
+            state_topic:"scanprint/failed/count",
+            unit_of_measurement:"Dokumente",
+            icon:"mdi:alert-circle-outline",
+            availability_topic:"scanprint/status",
+            payload_available:"online",
+            payload_not_available:"offline",
+            device:$device
+        }')"
+
+    mqtt_pub -r \
+        -t "$MQTT_DISCOVERY/sensor/scanprint/last_job/config" \
+        -m "$(jq -nc --argjson device "$DEVICE" '{
+            name:"Letzter Auftrag",
+            unique_id:"scanprint_last_job",
+            default_entity_id:"sensor.scanprint_last_job",
+            state_topic:"scanprint/last_job",
+            icon:"mdi:history",
+            availability_topic:"scanprint/status",
+            payload_available:"online",
+            payload_not_available:"offline",
+            device:$device
+        }')"
+
     mqtt_pub -r -t "$MQTT_BASE/copies/state" -m "$COPIES"
     mqtt_pub -r -t "$MQTT_BASE/mode/state" -m "$PRINT_MODE"
     mqtt_pub -r -t "$MQTT_BASE/status" -m "online"
-    mqtt_pub -r -t "$MQTT_BASE/job/status" -m "bereit"
+
+    publish_runtime_state
 }
 
 wait_until_stable() {
@@ -319,9 +518,12 @@ move_failed() {
 
     mv "$file" "$FAILED_DIR/${timestamp}_${basename}"
 
+    LAST_JOB="Fehler: $basename"
     mqtt_pub -r \
         -t "$MQTT_BASE/job/status" \
         -m "Fehler: $basename"
+
+    publish_runtime_state
 }
 
 print_file() {
@@ -331,6 +533,7 @@ print_file() {
     local basename
     local output
     local rc
+    local mode_text
 
     basename="$(basename "$file")"
 
@@ -341,6 +544,12 @@ print_file() {
             return 0
             ;;
     esac
+
+    if [ "$mode" = "duplex" ]; then
+        mode_text="Duplex"
+    else
+        mode_text="Simplex"
+    fi
 
     log "ERKANNT: $file"
 
@@ -353,7 +562,7 @@ print_file() {
 
     mqtt_pub -r \
         -t "$MQTT_BASE/job/status" \
-        -m "Drucke $basename"
+        -m "Drucke $basename – $mode_text"
 
     if [ "$mode" = "duplex" ]; then
         output="$(
@@ -393,35 +602,10 @@ print_file() {
         log_warn "$basename wurde gedruckt, konnte aber nicht gelöscht werden"
     fi
 
-    mqtt_pub -r \
-        -t "$MQTT_BASE/job/status" \
-        -m "bereit"
+    LAST_JOB="$basename | $mode_text | 1 Kopie"
+    publish_runtime_state
 
     return 0
-}
-
-get_oldest_multicopy_file() {
-    local file
-    local mtime
-    local oldest_file=""
-    local oldest_mtime=""
-
-    while IFS= read -r -d '' file; do
-        mtime="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
-
-        if [ -z "$oldest_file" ] || [ "$mtime" -lt "$oldest_mtime" ]; then
-            oldest_file="$file"
-            oldest_mtime="$mtime"
-        fi
-    done < <(
-        find "$MULTICOPY_DIR" \
-            -maxdepth 1 \
-            -type f \
-            -iname '*.pdf' \
-            -print0
-    )
-
-    printf '%s' "$oldest_file"
 }
 
 print_multicopy() {
@@ -432,13 +616,14 @@ print_multicopy() {
     local output
     local rc
 
-    file="$(get_oldest_multicopy_file)"
+    file="$(get_oldest_pdf "$MULTICOPY_DIR")"
 
     if [ -z "$file" ]; then
         log_warn "Keine Mehrfachkopie vorhanden"
         mqtt_pub -r \
             -t "$MQTT_BASE/job/status" \
             -m "Keine Mehrfachkopie vorhanden"
+        publish_runtime_state
         return 0
     fi
 
@@ -469,9 +654,7 @@ print_multicopy() {
     if [ "$PRINT_MODE" = "Duplex" ]; then
         if [ "$COLLATE" = "true" ]; then
             output="$(
-                lp \
-                    -h "$CUPS_SERVER" \
-                    -d "$queue" \
+                lp -h "$CUPS_SERVER" -d "$queue" \
                     -n "$COPIES" \
                     -o collate=true \
                     -o sides=two-sided-long-edge \
@@ -481,9 +664,7 @@ print_multicopy() {
             )"
         else
             output="$(
-                lp \
-                    -h "$CUPS_SERVER" \
-                    -d "$queue" \
+                lp -h "$CUPS_SERVER" -d "$queue" \
                     -n "$COPIES" \
                     -o collate=false \
                     -o sides=two-sided-long-edge \
@@ -492,13 +673,10 @@ print_multicopy() {
                     "$file" 2>&1
             )"
         fi
-        rc=$?
     else
         if [ "$COLLATE" = "true" ]; then
             output="$(
-                lp \
-                    -h "$CUPS_SERVER" \
-                    -d "$queue" \
+                lp -h "$CUPS_SERVER" -d "$queue" \
                     -n "$COPIES" \
                     -o collate=true \
                     -o sides=one-sided \
@@ -508,9 +686,7 @@ print_multicopy() {
             )"
         else
             output="$(
-                lp \
-                    -h "$CUPS_SERVER" \
-                    -d "$queue" \
+                lp -h "$CUPS_SERVER" -d "$queue" \
                     -n "$COPIES" \
                     -o collate=false \
                     -o sides=one-sided \
@@ -519,8 +695,9 @@ print_multicopy() {
                     "$file" 2>&1
             )"
         fi
-        rc=$?
     fi
+
+    rc=$?
 
     if [ "$rc" -ne 0 ]; then
         log_error "Mehrfachkopie fehlgeschlagen: $output"
@@ -536,9 +713,8 @@ print_multicopy() {
         log_warn "Mehrfachkopie gedruckt, Quelldatei konnte nicht gelöscht werden"
     fi
 
-    mqtt_pub -r \
-        -t "$MQTT_BASE/job/status" \
-        -m "bereit"
+    LAST_JOB="$basename | $mode_text | $COPIES Kopie(n)"
+    publish_runtime_state
 
     return 0
 }
@@ -617,6 +793,10 @@ mqtt_listener() {
 
 cleanup() {
     log "ScanPrint wird beendet"
+    READY_STATE="offline"
+    mqtt_pub -r \
+        -t "$MQTT_BASE/ready" \
+        -m "offline" 2>/dev/null || true
     mqtt_pub -r \
         -t "$MQTT_BASE/status" \
         -m "offline" 2>/dev/null || true
@@ -625,10 +805,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 create_directories
+validate_config
 load_state
 
 log "================================================="
-log "ScanPrint $APP_VERSION"
+log "ScanPrint $APP_VERSION ($APP_ARCH)"
 log "================================================="
 log "Konfiguration:"
 log "CUPS:           $CUPS_SERVER"
@@ -651,16 +832,31 @@ inotifywait \
     -m \
     -e close_write \
     -e moved_to \
+    -e create \
+    -e delete \
     --format '%w%f' \
     "$SIMPLE_DIR" \
-    "$DUPLEX_DIR" |
+    "$DUPLEX_DIR" \
+    "$MULTICOPY_DIR" \
+    "$FAILED_DIR" |
 while IFS= read -r file; do
     case "$file" in
         "$SIMPLE_DIR"/*)
-            print_file "$file" "$SIMPLE_QUEUE" "simple"
+            if [ -f "$file" ]; then
+                print_file "$file" "$SIMPLE_QUEUE" "simple"
+            else
+                publish_runtime_state
+            fi
             ;;
         "$DUPLEX_DIR"/*)
-            print_file "$file" "$DUPLEX_QUEUE" "duplex"
+            if [ -f "$file" ]; then
+                print_file "$file" "$DUPLEX_QUEUE" "duplex"
+            else
+                publish_runtime_state
+            fi
+            ;;
+        "$MULTICOPY_DIR"/*|"$FAILED_DIR"/*)
+            publish_runtime_state
             ;;
     esac
 done
