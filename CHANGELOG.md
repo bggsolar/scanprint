@@ -2,6 +2,19 @@
 
 All notable changes to ScanPrint are documented in this file.
 
+## [0.5.3] - 2026-11-10
+
+### Fixed
+- App no longer exits silently right after the precheck (restart loop) when
+  `lpstat -a` fails against the CUPS server. bashio enables `errexit` and
+  `pipefail`, so the informational queue listing added in 0.5.2 terminated the
+  whole script. The error is now logged as a warning.
+- A single failed print job (e.g. empty or unstable PDF) no longer terminates
+  the file watcher, the startup scan or the MQTT listener.
+
+### Changed
+- The shutdown log line now includes the exit code.
+
 ## [0.5.2] - 2026-08-22
 
 ### Added
