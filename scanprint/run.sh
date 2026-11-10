@@ -240,12 +240,16 @@ check_cups_connection() {
 
 list_available_queues() {
     local queues
+    local output
 
-    queues="$(
-        lpstat -h "$CUPS_SERVER" -a 2>/dev/null |
-        awk '{print $1}' |
-        sort -u
-    )"
+    # bashio setzt errexit + pipefail: ein Fehler von lpstat darf hier
+    # nicht das ganze Add-on beenden, die Liste ist nur informativ.
+    if ! output="$(lpstat -h "$CUPS_SERVER" -a 2>&1)"; then
+        log_warn "CUPS-Queues konnten nicht abgefragt werden: ${output:-ohne Meldung}"
+        return 0
+    fi
+
+    queues="$(printf '%s\n' "$output" | awk 'NF {print $1}' | sort -u)"
 
     if [ -n "$queues" ]; then
         log "Verfügbare CUPS-Queues:"
@@ -728,7 +732,7 @@ process_existing() {
         -iname '*.pdf' \
         -print0 |
     while IFS= read -r -d '' file; do
-        print_file "$file" "$SIMPLE_QUEUE" "simple"
+        print_file "$file" "$SIMPLE_QUEUE" "simple" || true
     done
 
     find "$DUPLEX_DIR" \
@@ -737,7 +741,7 @@ process_existing() {
         -iname '*.pdf' \
         -print0 |
     while IFS= read -r -d '' file; do
-        print_file "$file" "$DUPLEX_QUEUE" "duplex"
+        print_file "$file" "$DUPLEX_QUEUE" "duplex" || true
     done
 }
 
@@ -784,7 +788,7 @@ mqtt_listener() {
                 ;;
             "$MQTT_BASE/multicopy/print")
                 if [ "$payload" = "PRESS" ]; then
-                    print_multicopy
+                    print_multicopy || true
                 fi
                 ;;
         esac
@@ -792,7 +796,8 @@ mqtt_listener() {
 }
 
 cleanup() {
-    log "ScanPrint wird beendet"
+    local rc=$?
+    log "ScanPrint wird beendet (Exit-Code $rc)"
     READY_STATE="offline"
     mqtt_pub -r \
         -t "$MQTT_BASE/ready" \
@@ -843,14 +848,14 @@ while IFS= read -r file; do
     case "$file" in
         "$SIMPLE_DIR"/*)
             if [ -f "$file" ]; then
-                print_file "$file" "$SIMPLE_QUEUE" "simple"
+                print_file "$file" "$SIMPLE_QUEUE" "simple" || true
             else
                 publish_runtime_state
             fi
             ;;
         "$DUPLEX_DIR"/*)
             if [ -f "$file" ]; then
-                print_file "$file" "$DUPLEX_QUEUE" "duplex"
+                print_file "$file" "$DUPLEX_QUEUE" "duplex" || true
             else
                 publish_runtime_state
             fi
